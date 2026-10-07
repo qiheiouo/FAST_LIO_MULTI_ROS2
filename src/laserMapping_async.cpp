@@ -48,6 +48,7 @@
 #include "so3_math.h"
 #include "IMU_Processing.hpp"
 #include "preprocess.h"
+#include "pose_covariance.hpp"
 #include <ikd-Tree/ikd_Tree.h>
 // common_lib provides: get_time_sec(), get_ros_time()
 #include "common_lib.h"
@@ -594,18 +595,10 @@ void publish_odometry(
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+    odomAftMapped.pose.covariance = fast_lio::native_pose_covariance(
+        kf.get_P().block<6, 6>(0, 0), Eigen::Matrix3d::Identity(),
+        state_point.rot.toRotationMatrix());
     pubOdomAftMapped->publish(odomAftMapped);
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
-    }
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = map_frame;
