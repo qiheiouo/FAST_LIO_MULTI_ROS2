@@ -82,6 +82,7 @@ ImuProcess::ImuProcess()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
+  acc_s_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -95,6 +96,7 @@ void ImuProcess::Reset()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last       = Zero3d;
+  acc_s_last       = Zero3d;
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
@@ -474,6 +476,11 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     imu_need_init_ = true;
     
     last_imu_   = meas.imu.back();
+    // Initialization assumes rest at this measurement's end. The next
+    // propagation must start there, just as it does after an undistorted scan.
+    last_lidar_end_time_ = multi_lidar
+        ? std::max(meas.lidar_end_time, meas.lidar_end_time2)
+        : (lidar_num == 1 ? meas.lidar_end_time : meas.lidar_end_time2);
 
     if (init_iter_num > MAX_INI_COUNT)
     {

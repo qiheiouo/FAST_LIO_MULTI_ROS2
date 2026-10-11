@@ -841,8 +841,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     {
         if (point_selected_surf[i])
         {
-            laserCloudOri->points[effect_feat_num] = feats_down_body->points[i];
-            corr_normvect->points[effect_feat_num] = normvec->points[i];
+            laserCloudOri->push_back(feats_down_body->points[i]);
+            corr_normvect->push_back(normvec->points[i]);
             total_residual += res_last[i];
             effect_feat_num++;
             localizability_vec += Eigen::Vector3d(
