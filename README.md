@@ -169,3 +169,20 @@ The launch file wraps the same three mapping nodes (bundle / async / adaptive) a
   <br>
   <em>Side view - (left): Bundle (right): Async</em>
 </p>
+
+### RM2027 bundle input epoch boundary (2026-10-13)
+
+Only `laserMapping_bundle` implements this boundary. A source clock rollback
+or malformed/zero timestamp latches input rejection and clears both cloud/time
+queues, the IMU queue and the pending bundle. Duplicate stamps are dropped.
+The filter and map are deliberately retained for diagnosis; the latch cannot
+be cleared by new input or `ImuProcess::Reset`. Restart the complete backend
+and its canonical adapter together to establish a new epoch.
+
+`common.imu_max_gap_sec` bounds consecutive IMU **acquisition timestamps** when
+positive; `0.0` preserves the previous gap policy. Complete, ordered IMU
+backfill remains admissible. RM2027's opt-in software fixture uses `0.1` seconds
+(one configured 10 Hz scan); it is not a validated MID360 hardware budget.
+ESKF, deskew and registration mathematics are unchanged. Burst merging and
+cross-LiDAR point timing still require separate validation. This boundary is
+not motion authorization or a guarantee of physical stopping.
