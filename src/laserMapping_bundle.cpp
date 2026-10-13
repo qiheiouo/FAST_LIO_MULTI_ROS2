@@ -93,6 +93,11 @@ int effect_feat_num = 0;
 int feats_down_size = 0, NUM_MAX_ITERATIONS = 0, pcd_save_interval = -1, pcd_index = 0;
 bool point_selected_surf[100000] = {0};
 bool lidar_pushed = false, flg_exit = false;
+// A clock rollback cannot be repaired by clearing one queue: the filter/map
+// still belongs to the old epoch. Recovery requires a complete node restart.
+bool input_epoch_blocked = false;
+double imu_max_gap_sec = 0.0; // opt-in acquisition gap budget; zero keeps legacy policy
+
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 
 vector<BoxPointType> cub_needrm;
@@ -267,74 +272,91 @@ void lasermap_fov_segment()
         ikdtree.Delete_Point_Boxes(cub_needrm);
 }
 
+// Called under mtx_buffer; ROS uses a single-threaded executor below.
+void block_input_epoch(const char *reason)
+{
+    input_epoch_blocked = true;
+    lidar_buffer.clear(); time_buffer.clear();
+    lidar_buffer2.clear(); time_buffer2.clear(); imu_buffer.clear();
+    lidar_pushed = false;
+    std::cerr << "Input epoch blocked: " << reason
+              << "; restart the complete backend and adapter" << std::endl;
+}
+
+bool accept_input_stamp(const builtin_interfaces::msg::Time &stamp,
+                        double previous, bool is_imu)
+{
+    if (input_epoch_blocked) return false;
+    const double t = get_time_sec(stamp);
+    if (stamp.sec < 0 || stamp.nanosec >= 1000000000U || t <= 0.0)
+    {
+        block_input_epoch("invalid source timestamp");
+        return false;
+    }
+    if (t < previous)
+    {
+        block_input_epoch("source clock rollback");
+        return false;
+    }
+    if (t == previous) return false; // duplicate input must not integrate twice
+    if (is_imu && previous >= 0.0 && imu_max_gap_sec > 0.0 &&
+        t - previous > imu_max_gap_sec)
+    {
+        block_input_epoch("IMU acquisition gap exceeds the selected input budget");
+        return false;
+    }
+    return true;
+}
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-    }
+    std::lock_guard<mutex> lock(mtx_buffer);
+    if (!accept_input_stamp(msg->header.stamp, last_timestamp_lidar, false)) return;
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 0);
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(rclcpp::Time(msg->header.stamp).seconds());
-    last_timestamp_lidar = rclcpp::Time(msg->header.stamp).seconds();
-    mtx_buffer.unlock();
+    time_buffer.push_back(get_time_sec(msg->header.stamp));
+    last_timestamp_lidar = get_time_sec(msg->header.stamp);
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
 }
 
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar2)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer2.clear();
-    }
+    std::lock_guard<mutex> lock(mtx_buffer);
+    if (!accept_input_stamp(msg->header.stamp, last_timestamp_lidar2, false)) return;
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
     ptr->header.seq = 1; // trick to distinguish lidar2 if needed
     lidar_buffer2.push_back(ptr);
-    time_buffer2.push_back(rclcpp::Time(msg->header.stamp).seconds());
-    last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
-    mtx_buffer.unlock();
+    time_buffer2.push_back(get_time_sec(msg->header.stamp));
+    last_timestamp_lidar2 = get_time_sec(msg->header.stamp);
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
 }
 
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
-    mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-    }
-    last_timestamp_lidar = rclcpp::Time(msg->header.stamp).seconds();
+    std::lock_guard<mutex> lock(mtx_buffer);
+    if (!accept_input_stamp(msg->header.stamp, last_timestamp_lidar, false)) return;
+    last_timestamp_lidar = get_time_sec(msg->header.stamp);
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 0);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
 
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
 }
 
 void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
-    mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar2)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer2.clear();
-    }
-    last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
+    std::lock_guard<mutex> lock(mtx_buffer);
+    if (!accept_input_stamp(msg->header.stamp, last_timestamp_lidar2, false)) return;
+    last_timestamp_lidar2 = get_time_sec(msg->header.stamp);
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
@@ -342,7 +364,6 @@ void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     lidar_buffer2.push_back(ptr);
     time_buffer2.push_back(last_timestamp_lidar2);
 
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
 }
@@ -354,24 +375,20 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
         return;
 
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    double timestamp = rclcpp::Time(msg->header.stamp).seconds();
+    double timestamp = get_time_sec(msg->header.stamp);
 
-    mtx_buffer.lock();
-    if (timestamp < last_timestamp_imu)
-    {
-        std::cerr << "imu loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
-    }
+    std::lock_guard<mutex> lock(mtx_buffer);
+    if (!accept_input_stamp(msg->header.stamp, last_timestamp_imu, true)) return;
 
     last_timestamp_imu = timestamp;
     imu_buffer.push_back(msg);
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
 
 // Pure bundle sync (multi-lidar or single)
 bool sync_packages(MeasureGroup &meas)
 {
+    if (input_epoch_blocked) return false;
     if (multi_lidar)
     {
         if (lidar_buffer.empty() || lidar_buffer2.empty() || imu_buffer.empty())
@@ -925,6 +942,7 @@ public:
         this->declare_parameter<int>("common.max_iteration", 4);
         this->declare_parameter<bool>("common.async_debug", false);
         this->declare_parameter<bool>("common.multi_lidar", true);
+        this->declare_parameter<double>("common.imu_max_gap_sec", 0.0);
         this->declare_parameter<bool>("common.publish_tf_results", true);
 
         this->declare_parameter<std::string>("common.lid_topic", "/livox/lidar");
@@ -982,6 +1000,9 @@ public:
         this->get_parameter_or("common.max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or("common.async_debug", async_debug, false);
         this->get_parameter_or("common.multi_lidar", multi_lidar, true);
+        this->get_parameter_or("common.imu_max_gap_sec", imu_max_gap_sec, 0.0);
+        if (!std::isfinite(imu_max_gap_sec) || imu_max_gap_sec < 0.0)
+            throw std::invalid_argument("common.imu_max_gap_sec must be finite and nonnegative");
         this->get_parameter_or("common.publish_tf_results", publish_tf_results, true);
 
         this->get_parameter_or("common.lid_topic", lid_topic, std::string("/livox/lidar"));
