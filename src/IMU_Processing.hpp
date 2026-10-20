@@ -17,6 +17,9 @@
 
 #define MAX_INI_COUNT (10)
 
+// Numerical denominator guard only. This is not a physical acceleration limit.
+constexpr double kMinInitAccelerationNorm = 1.e-6;
+
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
 /// *************IMU Process and undistortion
@@ -48,7 +51,7 @@ class ImuProcess
   V3D cov_bias_acc;
 
  private:
-  void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
+  bool IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out, int lidar_num = 1);
   void UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
 
@@ -132,7 +135,7 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
-void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
+bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
@@ -144,18 +147,28 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     Reset();
     N = 1;
     b_first_frame_ = false;
-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
-    mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
-    mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
   }
 
+  bool accepted_sample = false;
+  sensor_msgs::msg::Imu::ConstSharedPtr last_valid_imu;
   for (const auto &imu : meas.imu)
   {
     const auto &imu_acc = imu->linear_acceleration;
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+
+    if (!cur_acc.allFinite() || !cur_gyr.allFinite() ||
+        cur_acc.norm() <= kMinInitAccelerationNorm)
+    {
+      continue;
+    }
+
+    if (N == 1)
+    {
+      mean_acc = cur_acc;
+      mean_gyr = cur_gyr;
+    }
 
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
@@ -166,9 +179,27 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
 
     N ++;
+    accepted_sample = true;
+    last_valid_imu = imu;
   }
+
+  const double mean_acc_norm = mean_acc.norm();
+  if (!accepted_sample || !mean_acc.allFinite() || !mean_gyr.allFinite() ||
+      !cov_acc.allFinite() || !cov_gyr.allFinite() ||
+      !std::isfinite(mean_acc_norm) ||
+      mean_acc_norm <= kMinInitAccelerationNorm)
+  {
+    if (accepted_sample)
+    {
+      // A finite batch can still form an unusable aggregate (for example,
+      // opposing acceleration vectors). Do not carry that state forward.
+      Reset();
+    }
+    return false;
+  }
+
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  init_state.grav = S2(- mean_acc / mean_acc_norm * G_m_s2);
   
   //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   init_state.bg  = mean_gyr;
@@ -184,8 +215,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
-  last_imu_ = meas.imu.back();
+  last_imu_ = last_valid_imu;
 
+  return true;
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out, int lidar_num)
@@ -470,12 +502,17 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 
   if (imu_need_init_)
   {
+    cur_pcl_un_->clear();
     /// The very first lidar frame
-    IMU_init(meas, kf_state, init_iter_num);
+    const bool init_updated = IMU_init(meas, kf_state, init_iter_num);
 
     imu_need_init_ = true;
-    
-    last_imu_   = meas.imu.back();
+
+    if (!init_updated)
+    {
+      return;
+    }
+
     // Initialization assumes rest at this measurement's end. The next
     // propagation must start there, just as it does after an undistorted scan.
     last_lidar_end_time_ = multi_lidar
